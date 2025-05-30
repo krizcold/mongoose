@@ -6,25 +6,25 @@
 #include <string.h> 
 #include <stdio.h>  
 #include <stdlib.h> 
+#include <errno.h>
 #include "mongoose.h"
 
 static int s_debug_level = MG_LL_INFO;
-static const char *s_root_dir = "C:\\balcon\\"; // Let's make webroot C:\balcon for serving files
+static const char *s_root_dir = "C:\\balcon\\"; 
 static const char *s_addr1 = "http://0.0.0.0:8000";
 #ifndef MG_TLS_DISABLED
 static const char *s_addr2 = "https://0.0.0.0:8443"; 
 #endif
 static const char *s_enable_hexdump = "no";
 static const char *s_ssi_pattern = "#.html";
-static const char *s_upload_dir = "C:\\balcon\\uploads"; // Upload dir
+static const char *s_upload_dir = "C:\\balcon\\uploads\\"; 
 
 static const char *s_balcon_script_path = "C:\\balcon\\run_balcon.bat";
-static const char *s_balcon_output_dir = "C:\\balcon\\"; // Directory where balcon.exe saves WAV files
+static const char *s_balcon_output_dir = "C:\\balcon\\"; 
 
 
-// Self signed certificates, only if TLS is not disabled
 #ifndef MG_TLS_DISABLED
-#ifdef TLS_TWOWAY // This is a custom define from the original example, keep if relevant for your TLS setup
+#ifdef TLS_TWOWAY 
 static const char *s_tls_ca =
     "-----BEGIN CERTIFICATE-----\n"
     "MIIBFTCBvAIJAMNTFtpfcq8NMAoGCCqGSM49BAMCMBMxETAPBgNVBAMMCE1vbmdv\n"
@@ -52,50 +52,38 @@ static const char *s_tls_key =
     "AwEHoUQDQgAEqN6BIhvgbk7ecmUcn8Da9Avkj/uDNERtqWJG9r/or26X4u9jR5Jl\n"
     "4hf5Gx17YJkq5/z3k6ogPDPpoAYWIw1/sw==\n"
     "-----END EC PRIVATE KEY-----\n";
-#endif // MG_TLS_DISABLED
+#endif 
 
-// Handle interrupts, like Ctrl-C
 static int s_signo;
 static void signal_handler(int signo) {
   s_signo = signo;
 }
 
-// Helper function to extract filename from balcon's -w argument
-// Very basic parser: looks for "-w" then the next token.
-// Returns a pointer within balcon_args_input, or NULL.
-// The caller should copy the result if it needs to persist beyond balcon_args_input's lifetime or modification.
 const char *extract_wav_filename(const char *balcon_args_input) {
     const char *w_option = strstr(balcon_args_input, "-w");
     if (w_option) {
-        const char *filename_start = w_option + 2; // Skip "-w"
-        while (*filename_start == ' ' || *filename_start == '\t') { // Skip whitespace
+        const char *filename_start = w_option + 2; 
+        while (*filename_start == ' ' || *filename_start == '\t') { 
             filename_start++;
         }
-        if (*filename_start == '\0') return NULL; // No filename after -w
+        if (*filename_start == '\0') return NULL; 
 
-        // Check if filename is quoted
         if (*filename_start == '"') {
-            filename_start++; // Skip opening quote
+            filename_start++; 
             const char *filename_end = strchr(filename_start, '"');
             if (filename_end) {
-                // For simplicity, we're assuming the filename itself doesn't contain quotes.
-                // This simple parser doesn't handle escaped quotes within a quoted filename.
-                // We'll just return the start. The actual filename length would be filename_end - filename_start.
-                // For serving, we'll reconstruct the full path and let mg_http_serve_file handle it.
-                // What we mostly need is the base name.
-                static char temp_filename[256]; // Static buffer for the extracted name
+                static char temp_filename[256]; 
                 size_t len = filename_end - filename_start;
                 if (len < sizeof(temp_filename)) {
                     strncpy(temp_filename, filename_start, len);
                     temp_filename[len] = '\0';
                     return temp_filename;
                 }
-                return NULL; // Filename too long for buffer
+                return NULL; 
             } else {
-                return NULL; // Unmatched quote
+                return NULL; 
             }
         } else {
-            // Not quoted, find end by space or end of string
             const char *filename_end = filename_start;
             while (*filename_end != '\0' && *filename_end != ' ' && *filename_end != '\t') {
                 filename_end++;
@@ -107,7 +95,7 @@ const char *extract_wav_filename(const char *balcon_args_input) {
                 temp_filename[len] = '\0';
                 return temp_filename;
             }
-            return NULL; // Filename too long
+            return NULL; 
         }
     }
     return NULL;
@@ -132,16 +120,14 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
     MG_INFO(("%.*s %.*s", (int) hm->method.len, hm->method.buf, (int) hm->uri.len, hm->uri.buf));
 
     if (mg_match(hm->uri, mg_str("/balcon"), NULL)) {
-      char balcon_args_unescaped[4096] = ""; // For unescaped args from query/POST
+      char balcon_args_unescaped[4096] = ""; 
       char command_to_run[4200];    
-      char requested_wav_filename[256] = ""; // To store the -w filename
-      char full_wav_path[MG_PATH_MAX];       // Full path to the generated WAV
+      char requested_wav_filename[256] = ""; 
+      char full_wav_path[MG_PATH_MAX];       
 
-      // Get 'args' from query string (for GET) or POST body
       char temp_args_buffer[4096] = "";
       mg_http_get_var(&hm->query, "args", temp_args_buffer, sizeof(temp_args_buffer) -1);
       if (temp_args_buffer[0] == '\0' && mg_match(hm->method, mg_str("POST"), NULL)) {
-          // Simplified POST 'args' extraction (assumes 'args=value' or plain text body if short)
           if (hm->body.len > 0 && hm->body.len < sizeof(temp_args_buffer) -1 ) {
               const char* post_body_str = hm->body.buf;
               size_t post_body_len = hm->body.len;
@@ -156,13 +142,9 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
       }
       temp_args_buffer[sizeof(temp_args_buffer)-1] = '\0';
 
-
-      // URL decode the arguments from temp_args_buffer into balcon_args_unescaped
-      // Mongoose's mg_url_decode is good for this. It decodes in-place.
       strncpy(balcon_args_unescaped, temp_args_buffer, sizeof(balcon_args_unescaped) - 1);
       balcon_args_unescaped[sizeof(balcon_args_unescaped) - 1] = '\0';
       mg_url_decode(balcon_args_unescaped, strlen(balcon_args_unescaped), balcon_args_unescaped, sizeof(balcon_args_unescaped), 0);
-
 
       if (balcon_args_unescaped[0] != '\0') {
         const char *extracted_filename = extract_wav_filename(balcon_args_unescaped);
@@ -172,13 +154,8 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
             MG_INFO(("Requested output WAV filename: %s", requested_wav_filename));
         } else {
             MG_INFO(("No -w option found or filename is empty in balcon args. Cannot serve file back."));
-            // No specific filename means we can't easily serve it back with this logic.
-            // You could default to a name, or just execute without serving.
         }
 
-        // IMPORTANT: For system() and cmd /C, arguments with spaces or special characters
-        // often need to be quoted again, even if they were URL decoded.
-        // The balcon_args_unescaped should be fine for run_balcon.bat as it passes %*
         snprintf(command_to_run, sizeof(command_to_run), "cmd /C \"\"%s\" %s\"", s_balcon_script_path, balcon_args_unescaped);
         MG_INFO(("Executing Balcon script: %s", command_to_run));
 
@@ -188,40 +165,22 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
           if (requested_wav_filename[0] != '\0') {
             snprintf(full_wav_path, sizeof(full_wav_path), "%s%s", s_balcon_output_dir, requested_wav_filename);
             
-            // Check if file exists before trying to serve
-            FILE *fp = fopen(full_wav_path, "rb");
-            if (fp) {
-                fclose(fp);
+            FILE *fp_wav = fopen(full_wav_path, "rb");
+            if (fp_wav) {
+                fclose(fp_wav);
                 MG_INFO(("Attempting to serve WAV file: %s", full_wav_path));
-                // Set headers for file download
-                // mg_http_serve_file will set Content-Type based on extension if possible.
-                // We can add Content-Disposition to suggest a filename to the browser.
                 char extra_headers[512];
                 snprintf(extra_headers, sizeof(extra_headers), 
                          "Content-Disposition: attachment; filename=\"%s\"\r\n"
-                         "Access-Control-Allow-Origin: *\r\n", // CORS header for broader client access
+                         "Access-Control-Allow-Origin: *\r\n", 
                          requested_wav_filename);
 
                 struct mg_http_serve_opts opts = {0};
-                opts.root_dir = s_balcon_output_dir; // Serve from the output directory
+                opts.root_dir = s_balcon_output_dir; 
                 opts.extra_headers = extra_headers;
                 
-                // Mongoose needs filename relative to root_dir for mg_http_serve_file
                 mg_http_serve_file(c, hm, requested_wav_filename, &opts);
                 
-                // Delete the file after serving
-
-                // !!!!!!!!!!!!!!!!!!!!!!
-
-                // REMINDER TO UNCOMMENT THE FILE DELETION CODE BELOW
-
-                // !!!!!!!!!!!!!!!!!!!!!!!!!!
-
-                // if (remove(full_wav_path) == 0) {
-                //   MG_INFO(("Successfully deleted served WAV file: %s", full_wav_path));
-                // } else {
-                //   MG_ERROR(("Error deleting served WAV file: %s", full_wav_path));
-                // }
               } else {
                 MG_ERROR(("Generated WAV file not found or not readable: %s", full_wav_path));
                 mg_http_reply(c, 500, "Content-Type: text/plain\r\n", "Balcon command ran, but output WAV file not found.\n");
@@ -239,7 +198,6 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
       }
       return; 
     } 
-    // ... (rest of /upload and static file serving logic from previous version) ...
     else if (s_upload_dir != NULL && mg_match(hm->uri, mg_str("/upload"), NULL)) {
       struct mg_http_part part;
       size_t pos = 0, total_bytes = 0, num_files = 0;
@@ -251,15 +209,27 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
                  (unsigned long)part.body.len));
         
         if (part.filename.len > 0) { 
-            mg_snprintf(file_path_buffer, sizeof(file_path_buffer), "%s\\%.*s", s_upload_dir, // Use backslash for Windows paths
+            mg_snprintf(file_path_buffer, sizeof(file_path_buffer), "%s\\%.*s", s_upload_dir,
                         (int)part.filename.len, part.filename.buf);
+            MG_INFO(("Attempting to write to: [%s]", file_path_buffer)); 
+            MG_INFO(("File content pointer: [%p], length: [%lu]", part.body.buf, (unsigned long)part.body.len));
 
             if (mg_path_is_sane(mg_str(file_path_buffer))) {
-                if (mg_file_write(NULL, file_path_buffer, part.body.buf, part.body.len)) { 
-                    total_bytes += part.body.len;
-                    num_files++;
+                MG_INFO(("Path is sane. Attempting manual write to: %s", file_path_buffer));
+                FILE *fp_upload = fopen(file_path_buffer, "wb"); 
+                if (fp_upload != NULL) {
+                    size_t bytes_written = fwrite(part.body.buf, 1, part.body.len, fp_upload);
+                    fclose(fp_upload);
+                    if (bytes_written == part.body.len) {
+                        MG_INFO(("Successfully wrote %lu bytes manually to %s", (unsigned long)bytes_written, file_path_buffer));
+                        total_bytes += bytes_written;
+                        num_files++;
+                    } else {
+                        MG_ERROR(("Manual fwrite error: wrote %lu of %lu bytes to %s. Error flag: %d, errno: %d", 
+                                  (unsigned long)bytes_written, (unsigned long)part.body.len, file_path_buffer, ferror(fp_upload), errno));
+                    }
                 } else {
-                    MG_ERROR(("Failed to write file: %s", file_path_buffer));
+                    MG_ERROR(("Manual fopen failed for %s. errno: %d", file_path_buffer, errno)); 
                 }
             } else {
                 MG_ERROR(("Rejecting dangerous path for upload: %s", file_path_buffer));
@@ -274,16 +244,11 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
       mg_http_reply(c, 200, "Content-Type: text/plain\r\n", reply_buf);
       return; 
     } 
-    else { // Serve static files from s_root_dir
+    else { 
       struct mg_http_serve_opts opts = {0}; 
       opts.root_dir = s_root_dir;
       opts.ssi_pattern = s_ssi_pattern; 
-      // Example: Serve index.html if URI is "/"
-      // if (mg_match(hm->uri, mg_str("/"), NULL) || mg_match(hm->uri, mg_str("/index.html"), NULL)) {
-      //    mg_http_serve_file(c, hm, "index.html", &opts);
-      //} else {
-          mg_http_serve_dir(c, hm, &opts);
-      //}
+      mg_http_serve_dir(c, hm, &opts);
     }
   }
 }
@@ -308,11 +273,6 @@ int main(int argc, char *argv[]) {
   struct mg_mgr mgr;
   int i;
 
-  // Default s_root_dir (can be overridden by -d)
-  // If s_upload_dir is not set by command line, you could default it here if desired.
-  // e.g., if (s_upload_dir == NULL) s_upload_dir = "C:\\balcon\\uploads";
-
-
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-d") == 0) {
       s_root_dir = argv[++i];
@@ -335,22 +295,39 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Ensure s_balcon_output_dir ends with a path separator if it's used for concatenation
-  // (It's already defined with one, so this is just a safety check concept)
-  // size_t len_out_dir = strlen(s_balcon_output_dir);
-  // if (len_out_dir > 0 && s_balcon_output_dir[len_out_dir - 1] != '\\' && s_balcon_output_dir[len_out_dir - 1] != '/') {
-  //    // This would require s_balcon_output_dir to be non-const or use a temp buffer
-  // }
-
-
   if (strchr(s_root_dir, ',') == NULL) { 
-    if(realpath(s_root_dir, path) != NULL) s_root_dir = path; // Use resolved path if successful
+    if(realpath(s_root_dir, path) != NULL) s_root_dir = path; 
   }
   if (s_upload_dir && strchr(s_upload_dir, ',') == NULL) {
       char upload_path_resolved[MG_PATH_MAX];
-      if(realpath(s_upload_dir, upload_path_resolved) != NULL) s_upload_dir = strdup(upload_path_resolved); // strdup to make it modifiable if needed
+      // Check if realpath can resolve s_upload_dir, if so, duplicate it.
+      // Note: strdup allocates memory that needs to be freed if s_upload_dir is changed later or at exit.
+      // For this application's lifecycle, if s_upload_dir is set once from argv and used till exit,
+      // freeing it might be optional if the OS reclaims memory on process exit.
+      // However, for robustness, if you were to change s_upload_dir multiple times, you'd manage memory.
+      char *resolved_upload_path_ptr = realpath(s_upload_dir, upload_path_resolved);
+      if (resolved_upload_path_ptr != NULL) {
+          // s_upload_dir is const char*, so we can't directly assign upload_path_resolved (char[])
+          // or resolved_upload_path_ptr (char*) if it points to upload_path_resolved.
+          // If you need to modify s_upload_dir globally, it shouldn't be const.
+          // For now, assuming s_upload_dir is set once and used.
+          // If using a global non-const char* and strdup, remember to free it.
+          // Since s_upload_dir is const, this assignment might be problematic if realpath modifies input.
+          // A safer way if s_upload_dir must remain const is to use upload_path_resolved locally where needed,
+          // or have a non-const global that you strdup into.
+          // Given the current structure, we'll assume realpath fills upload_path_resolved and we use that.
+          // This part needs careful handling of const-correctness if s_upload_dir were to be updated.
+          // For this specific case, since s_upload_dir is only read after this, assigning its initial value
+          // from a resolved path (if different) is the goal.
+          // If s_upload_dir is from argv, it's already on the stack/heap.
+          // Let's assume s_upload_dir from argv is what we use, and realpath just validates/resolves it.
+          // The original code had `s_upload_dir = strdup(...)` which means s_upload_dir would need to be `char *` not `const char *`.
+          // Sticking to `const char *s_upload_dir`, we'd use `upload_path_resolved` locally or ensure initial value is absolute.
+          // For simplicity of this change, I'll keep s_upload_dir as is and assume it's set to an absolute path.
+          // The original strdup line implies s_upload_dir was char* and was freed later.
+          // If s_upload_dir is "C:\\balcon\\uploads\\", realpath is fine.
+      }
   }
-
 
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
@@ -368,7 +345,6 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  // Start infinite event loop
   MG_INFO(("Mongoose version : v%s", MG_VERSION));
   MG_INFO(("HTTP listener    : %s", s_addr1));
 #ifndef MG_TLS_DISABLED
@@ -381,6 +357,7 @@ int main(int argc, char *argv[]) {
   while (s_signo == 0) mg_mgr_poll(&mgr, 1000); 
   mg_mgr_free(&mgr); 
   MG_INFO(("Exiting on signal %d", s_signo));
-  if (s_upload_dir && strchr(s_upload_dir, ',') == NULL) free((void *)s_upload_dir); // Free duplicated string
+  // If s_upload_dir was strdup'd, free it here:
+  // if (s_upload_dir_is_dynamic_allocated_flag) free((void*)s_upload_dir);
   return 0;
 }
