@@ -133,11 +133,11 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
               size_t post_body_len = hm->body.len;
               if (strncmp(post_body_str, "args=", 5) == 0) {
                   strncpy(temp_args_buffer, post_body_str + 5, sizeof(temp_args_buffer) -1 );
-                  temp_args_buffer[sizeof(temp_args_buffer)-1] = '\0';
               } else {
                   strncpy(temp_args_buffer, post_body_str, post_body_len);
-                  temp_args_buffer[post_body_len] = '\0';
+                  temp_args_buffer[post_body_len] = '\0'; // Ensure null termination if strncpy doesn't fill
               }
+              temp_args_buffer[sizeof(temp_args_buffer)-1] = '\0'; // Ensure null termination
           }
       }
       temp_args_buffer[sizeof(temp_args_buffer)-1] = '\0';
@@ -158,13 +158,11 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
 
         snprintf(command_to_run, sizeof(command_to_run), "cmd /C \"\"%s\" %s\"", s_balcon_script_path, balcon_args_unescaped);
         MG_INFO(("Executing Balcon script: %s", command_to_run));
-
         int system_result = system(command_to_run); 
 
         if (system_result == 0) {
           if (requested_wav_filename[0] != '\0') {
             snprintf(full_wav_path, sizeof(full_wav_path), "%s%s", s_balcon_output_dir, requested_wav_filename);
-            
             FILE *fp_wav = fopen(full_wav_path, "rb");
             if (fp_wav) {
                 fclose(fp_wav);
@@ -174,13 +172,10 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
                          "Content-Disposition: attachment; filename=\"%s\"\r\n"
                          "Access-Control-Allow-Origin: *\r\n", 
                          requested_wav_filename);
-
                 struct mg_http_serve_opts opts = {0};
                 opts.root_dir = s_balcon_output_dir; 
                 opts.extra_headers = extra_headers;
-                
                 mg_http_serve_file(c, hm, requested_wav_filename, &opts);
-                
               } else {
                 MG_ERROR(("Generated WAV file not found or not readable: %s", full_wav_path));
                 mg_http_reply(c, 500, "Content-Type: text/plain\r\n", "Balcon command ran, but output WAV file not found.\n");
@@ -201,45 +196,69 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
     else if (s_upload_dir != NULL && mg_match(hm->uri, mg_str("/upload"), NULL)) {
       struct mg_http_part part;
       size_t pos = 0, total_bytes = 0, num_files = 0;
+      char file_path_buffer[MG_PATH_MAX]; 
+      FILE *fp_upload = NULL;
+      bool first_part_for_file = true;
+
+      // Loop through multipart parts
       while ((pos = mg_http_next_multipart(hm->body, pos, &part)) > 0) {
-        char file_path_buffer[MG_PATH_MAX]; 
         MG_INFO(("Chunk name: [%.*s] filename: [%.*s] length: %lu bytes",
                  (int)part.name.len, part.name.buf, 
                  (int)part.filename.len, part.filename.buf, 
                  (unsigned long)part.body.len));
         
-        if (part.filename.len > 0) { 
-            mg_snprintf(file_path_buffer, sizeof(file_path_buffer), "%s\\%.*s", s_upload_dir,
-                        (int)part.filename.len, part.filename.buf);
-            MG_INFO(("Attempting to write to: [%s]", file_path_buffer)); 
-            MG_INFO(("File content pointer: [%p], length: [%lu]", part.body.buf, (unsigned long)part.body.len));
-
-            if (mg_path_is_sane(mg_str(file_path_buffer))) {
-                MG_INFO(("Path is sane. Attempting manual write to: %s", file_path_buffer));
-                FILE *fp_upload = fopen(file_path_buffer, "wb"); 
-                if (fp_upload != NULL) {
-                    size_t bytes_written = fwrite(part.body.buf, 1, part.body.len, fp_upload);
-                    fclose(fp_upload);
-                    if (bytes_written == part.body.len) {
-                        MG_INFO(("Successfully wrote %lu bytes manually to %s", (unsigned long)bytes_written, file_path_buffer));
-                        total_bytes += bytes_written;
-                        num_files++;
-                    } else {
-                        MG_ERROR(("Manual fwrite error: wrote %lu of %lu bytes to %s. Error flag: %d, errno: %d", 
-                                  (unsigned long)bytes_written, (unsigned long)part.body.len, file_path_buffer, ferror(fp_upload), errno));
-                    }
-                } else {
-                    MG_ERROR(("Manual fopen failed for %s. errno: %d", file_path_buffer, errno)); 
+        if (part.filename.len > 0) { // This part is a file
+            if (first_part_for_file) {
+                // Construct path and open file only for the first part with this filename
+                mg_snprintf(file_path_buffer, sizeof(file_path_buffer), "%s\\%.*s", s_upload_dir,
+                            (int)part.filename.len, part.filename.buf);
+                MG_INFO(("Opening file for writing: [%s]", file_path_buffer));
+                
+                if (!mg_path_is_sane(mg_str(file_path_buffer))) {
+                    MG_ERROR(("Rejecting dangerous path for upload: %s", file_path_buffer));
+                    if (fp_upload) { fclose(fp_upload); fp_upload = NULL; } // Close if opened by a previous bad part
+                    break; // Stop processing this upload
                 }
-            } else {
-                MG_ERROR(("Rejecting dangerous path for upload: %s", file_path_buffer));
+                fp_upload = fopen(file_path_buffer, "wb"); // Open in write binary mode
+                if (fp_upload == NULL) {
+                    MG_ERROR(("Manual fopen failed for %s. errno: %d", file_path_buffer, errno)); 
+                    break; // Stop processing this upload
+                }
+                first_part_for_file = false; // Subsequent parts append to this opened file
+            }
+
+            if (fp_upload) { // If file is successfully opened
+                MG_INFO(("Writing %lu bytes to %s", (unsigned long)part.body.len, file_path_buffer));
+                size_t bytes_written = fwrite(part.body.buf, 1, part.body.len, fp_upload);
+                if (bytes_written == part.body.len) {
+                    fflush(fp_upload); // Flush after each successful chunk write
+                    MG_INFO(("Successfully wrote %lu bytes manually to %s", (unsigned long)bytes_written, file_path_buffer));
+                    total_bytes += bytes_written;
+                    // num_files is tricky here, it's one file but multiple parts. 
+                    // Let's increment only if it's the first part that successfully opens/writes.
+                    if (total_bytes == bytes_written) num_files++; // Count as one file if first write
+                } else {
+                    MG_ERROR(("Manual fwrite error: wrote %lu of %lu bytes to %s. Error flag: %d, errno: %d", 
+                              (unsigned long)bytes_written, (unsigned long)part.body.len, file_path_buffer, ferror(fp_upload), errno));
+                    fclose(fp_upload); // Close on error
+                    fp_upload = NULL;
+                    break; // Stop processing this upload
+                }
             }
         } else {
             MG_INFO(("Skipping part with no filename. Name: [%.*s]", (int)part.name.len, part.name.buf));
         }
+      } // End of while loop for multipart parts
+
+      // Close the file if it was opened
+      if (fp_upload != NULL) {
+          fclose(fp_upload);
+          fp_upload = NULL;
+          MG_INFO(("Finished writing and closed file: %s", file_path_buffer));
       }
+
       char reply_buf[128]; 
-      mg_snprintf(reply_buf, sizeof(reply_buf), "Uploaded %lu files, %lu bytes\n", 
+      mg_snprintf(reply_buf, sizeof(reply_buf), "Uploaded %lu file(s), %lu bytes total\n", 
                    (unsigned long)num_files, (unsigned long)total_bytes);
       mg_http_reply(c, 200, "Content-Type: text/plain\r\n", reply_buf);
       return; 
@@ -272,6 +291,7 @@ int main(int argc, char *argv[]) {
   char path[MG_PATH_MAX] = "."; 
   struct mg_mgr mgr;
   int i;
+  char *upload_dir_dynamic = NULL; // For strdup if s_upload_dir comes from argv
 
   for (i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-d") == 0) {
@@ -287,7 +307,7 @@ int main(int argc, char *argv[]) {
       s_addr2 = argv[++i];
 #endif
     } else if (strcmp(argv[i], "-u") == 0) {
-      s_upload_dir = argv[++i];
+      s_upload_dir = argv[++i]; // If -u is used, s_upload_dir points to argv string
     } else if (strcmp(argv[i], "-v") == 0) {
       s_debug_level = atoi(argv[++i]);
     } else {
@@ -298,35 +318,18 @@ int main(int argc, char *argv[]) {
   if (strchr(s_root_dir, ',') == NULL) { 
     if(realpath(s_root_dir, path) != NULL) s_root_dir = path; 
   }
+
+  // Resolve s_upload_dir if it's set and not a comma-separated list (for logging/validation)
+  // s_upload_dir itself remains the const char * set by default or argv.
   if (s_upload_dir && strchr(s_upload_dir, ',') == NULL) {
-      char upload_path_resolved[MG_PATH_MAX];
-      // Check if realpath can resolve s_upload_dir, if so, duplicate it.
-      // Note: strdup allocates memory that needs to be freed if s_upload_dir is changed later or at exit.
-      // For this application's lifecycle, if s_upload_dir is set once from argv and used till exit,
-      // freeing it might be optional if the OS reclaims memory on process exit.
-      // However, for robustness, if you were to change s_upload_dir multiple times, you'd manage memory.
-      char *resolved_upload_path_ptr = realpath(s_upload_dir, upload_path_resolved);
-      if (resolved_upload_path_ptr != NULL) {
-          // s_upload_dir is const char*, so we can't directly assign upload_path_resolved (char[])
-          // or resolved_upload_path_ptr (char*) if it points to upload_path_resolved.
-          // If you need to modify s_upload_dir globally, it shouldn't be const.
-          // For now, assuming s_upload_dir is set once and used.
-          // If using a global non-const char* and strdup, remember to free it.
-          // Since s_upload_dir is const, this assignment might be problematic if realpath modifies input.
-          // A safer way if s_upload_dir must remain const is to use upload_path_resolved locally where needed,
-          // or have a non-const global that you strdup into.
-          // Given the current structure, we'll assume realpath fills upload_path_resolved and we use that.
-          // This part needs careful handling of const-correctness if s_upload_dir were to be updated.
-          // For this specific case, since s_upload_dir is only read after this, assigning its initial value
-          // from a resolved path (if different) is the goal.
-          // If s_upload_dir is from argv, it's already on the stack/heap.
-          // Let's assume s_upload_dir from argv is what we use, and realpath just validates/resolves it.
-          // The original code had `s_upload_dir = strdup(...)` which means s_upload_dir would need to be `char *` not `const char *`.
-          // Sticking to `const char *s_upload_dir`, we'd use `upload_path_resolved` locally or ensure initial value is absolute.
-          // For simplicity of this change, I'll keep s_upload_dir as is and assume it's set to an absolute path.
-          // The original strdup line implies s_upload_dir was char* and was freed later.
-          // If s_upload_dir is "C:\\balcon\\uploads\\", realpath is fine.
+    char upload_path_resolved_buf[MG_PATH_MAX];
+    if(realpath(s_upload_dir, upload_path_resolved_buf) != NULL) {
+      if (strcmp(s_upload_dir, upload_path_resolved_buf) != 0) {
+        MG_INFO(("Upload directory configured as [%s], resolves to [%s]", s_upload_dir, upload_path_resolved_buf));
       }
+    } else {
+      MG_INFO(("Could not resolve upload directory path: [%s]", s_upload_dir));
+    }
   }
 
   signal(SIGINT, signal_handler);
@@ -357,7 +360,6 @@ int main(int argc, char *argv[]) {
   while (s_signo == 0) mg_mgr_poll(&mgr, 1000); 
   mg_mgr_free(&mgr); 
   MG_INFO(("Exiting on signal %d", s_signo));
-  // If s_upload_dir was strdup'd, free it here:
-  // if (s_upload_dir_is_dynamic_allocated_flag) free((void*)s_upload_dir);
+  if (upload_dir_dynamic) free(upload_dir_dynamic); 
   return 0;
 }
