@@ -105,7 +105,7 @@ static void cleanup_wav_files_at_startup(const char *directory, int max_age_seco
         if (GetLastError() != ERROR_FILE_NOT_FOUND) { 
             MG_ERROR(("FindFirstFile failed for cleanup in %s. Error code: %lu", dir_with_slash, GetLastError()));
         } else {
-            MG_INFO(("No .wav files found for startup cleanup in %s.", dir_with_slash));
+            MG_INFO(("No .wav files found for cleanup in %s.", dir_with_slash));
         }
         return;
     }
@@ -345,6 +345,7 @@ static void cb(struct mg_connection *c, int ev, void *ev_data) {
                 opts.extra_headers = extra_headers;
                 
                 mg_http_serve_file(c, hm, full_wav_path_for_serving_and_delete, &opts); 
+                // File is NOT deleted here. Cleanup is by startup/periodic.
               } else {
                 MG_ERROR(("Generated WAV file not found or not readable: %s", full_wav_path_for_serving_and_delete));
                 mg_http_reply(c, 500, "Content-Type: text/plain\r\n", "Balcon command ran, but output WAV file not found.\n");
@@ -463,6 +464,9 @@ int main(int argc, char *argv[]) {
   struct mg_mgr mgr;
   int i;
   #define WAV_FILE_MAX_AGE_SECONDS (5 * 60) 
+  #define CLEANUP_INTERVAL_SECONDS (5 * 60)     // Check every 5 minutes
+
+  time_t last_cleanup_time = time(NULL); 
 
   cleanup_wav_files_at_startup(s_balcon_wav_output_dir, WAV_FILE_MAX_AGE_SECONDS); 
 
@@ -528,7 +532,18 @@ int main(int argc, char *argv[]) {
   MG_INFO(("Upload dir       : [%s]", s_upload_dir ? s_upload_dir : "unset"));
   MG_INFO(("Balcon script    : [%s]", s_balcon_script_path)); 
   MG_INFO(("Balcon WAV output dir: [%s]", s_balcon_wav_output_dir)); 
-  while (s_signo == 0) mg_mgr_poll(&mgr, 1000); 
+  
+  while (s_signo == 0) {
+    mg_mgr_poll(&mgr, 1000); 
+
+    time_t current_time = time(NULL);
+    if (difftime(current_time, last_cleanup_time) >= CLEANUP_INTERVAL_SECONDS) {
+      MG_INFO(("-- Periodic WAV file cleanup triggered --"));
+      cleanup_wav_files_at_startup(s_balcon_wav_output_dir, WAV_FILE_MAX_AGE_SECONDS);
+      last_cleanup_time = current_time;
+    }
+  } 
+  
   mg_mgr_free(&mgr); 
   MG_INFO(("Exiting on signal %d", s_signo));
   return 0;
